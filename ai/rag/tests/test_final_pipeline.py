@@ -1,0 +1,314 @@
+"""다운로드나 외부 LLM 없이 최종 파이프라인 계약을 검증한다."""
+
+from __future__ import annotations
+
+from copy import deepcopy
+import tempfile
+import unittest
+
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+
+from ai.llm.evaluation.retrieval_eval import evaluate, validate_no_relic_labels_in_queries
+from ai.llm.prompts import (
+    DOCENT_SYSTEM_PROMPT,
+    FIRST_FOLLOW_UP_INSTRUCTION,
+    INITIAL_DESCRIPTION_INSTRUCTION,
+    LATER_FOLLOW_UP_INSTRUCTION,
+    VISITOR_INSTRUCTIONS,
+)
+from ai.rag.chat import DocentChatService
+from ai.rag.config import load_config, project_path
+from ai.rag.document_builder import build_documents
+from ai.rag.docent import ArtifactNotFound, Docent
+from ai.rag.gold_loader import get_relic_records_by_label, gold_summary, load_gold
+from ai.rag.retriever import retrieve
+from ai.rag.vector_store import build_chroma, close_chroma, open_chroma
+
+
+class DummyEmbeddings(Embeddings):
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [[float(len(text)), float(sum(map(ord, text)) % 97)] for text in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        return [float(len(text)), float(sum(map(ord, text)) % 97)]
+
+
+class FakeStore:
+    def __init__(self, documents: list[Document]):
+        self.documents = documents
+        self.queries: list[tuple[str, int]] = []
+
+    def similarity_search_with_score(self, query: str, k: int):
+        self.queries.append((query, k))
+        return [(document, index / 10) for index, document in enumerate(self.documents[:k])]
+
+
+class FinalPipelineTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.config = load_config("ai/llm/configs/base.yaml")
+        cls.gold_path = project_path(cls.config["data"]["gold_path"])
+        cls.rows = load_gold(cls.gold_path)
+
+    def test_gold_schema_and_existing_ids_are_preserved(self):
+        summary = gold_summary(self.rows)
+        self.assertEqual(summary["records"], 7)
+        self.assertEqual(summary["unique_chunk_ids"], 7)
+        self.assertEqual(summary["empty_documents"], 0)
+        documents = build_documents(self.rows)
+        self.assertEqual(len(documents), len(self.rows))
+        self.assertEqual([document.id for document in documents], [row["chunk_id"] for row in self.rows])
+        self.assertIn("유물 정보:", documents[0].page_content)
+        self.assertNotIn(str(self.rows[0]), documents[0].page_content)
+
+    def test_direct_lookup_returns_all_existing_chunks_for_label(self):
+        records = get_relic_records_by_label(self.gold_path, "본관 2789")
+        self.assertEqual(
+            {record["chunk_id"] for record in records},
+            {"nmm-bon-002789-00:desc-00"},
+        )
+
+    def test_chroma_one_document_per_gold_record_and_persist_reload(self):
+        documents = build_documents(self.rows[:3])
+        with tempfile.TemporaryDirectory() as directory:
+            vector = {
+                "persist_directory": directory,
+                "collection_name": "test_gold_chunks",
+                "embedding_model": "dummy/test",
+                "add_batch_size": 2,
+            }
+            store, stats = build_chroma(documents, DummyEmbeddings(), vector, rebuild=True)
+            self.assertEqual(stats["gold_documents"], 3)
+            self.assertEqual(stats["chroma_documents"], 3)
+            self.assertEqual(store._collection.count(), 3)
+            reloaded = open_chroma(vector, DummyEmbeddings())
+            self.assertEqual(reloaded._collection.count(), 3)
+            repeated_store, repeated = build_chroma(documents, DummyEmbeddings(), vector)
+            self.assertEqual(repeated["chroma_documents"], 3)
+            close_chroma(repeated_store)
+            close_chroma(reloaded)
+            close_chroma(store)
+
+    def test_retriever_searches_without_relic_filter_and_normalizes(self):
+        docs = [
+            Document(id="A", page_content="첫 자료", metadata={"chunk_id": "A", "relic_label": "본관 1"}),
+            Document(id="B", page_content="둘째 자료", metadata={"chunk_id": "B", "relic_label": "본관 2"}),
+        ]
+        store = FakeStore(docs)
+        results = retrieve(store, "비교", {"top_k": 2})
+        self.assertEqual(store.queries, [("비교", 2)])
+        self.assertEqual([item["chunk_id"] for item in results], ["A", "B"])
+        self.assertEqual(results[1]["score"], 0.9)
+
+    def test_multiturn_rewrite_retrieval_and_history_are_connected(self):
+        docs = [Document(
+            id="other:profile",
+            page_content="다른 유물 자료",
+            metadata={"chunk_id": "other:profile", "relic_label": "본관 2"},
+        )]
+        calls = []
+
+        def fake_generate(messages, _config):
+            calls.append(deepcopy(messages))
+            if "재작성기" in messages[0]["content"]:
+                return "감산사에서 발견된 다른 유물"
+            return "도슨트 답변"
+
+        runtime = deepcopy(self.config)
+        runtime["data"]["gold_path"] = str(self.gold_path)
+        service = DocentChatService(config=runtime, store=FakeStore(docs), generate_fn=fake_generate)
+        initial = service.describe_relic(relic_label="본관 2789")
+        follow = service.answer_follow_up("그곳에서는 또 어떤 유물이 발견됐어?",
+                                          session_id=initial["session_id"])
+        self.assertEqual(follow["retrieval_query"], "감산사에서 발견된 다른 유물")
+        self.assertEqual(follow["retrieved"][0]["relic_label"], "본관 2")
+        session = service.get_session(initial["session_id"])
+        self.assertEqual([message["role"] for message in session["history"]],
+                         ["assistant", "user", "assistant"])
+        self.assertIn("도슨트 답변", calls[1][1]["content"])
+
+    def test_visitor_instruction_is_added_to_answer_system_prompt(self):
+        calls = []
+
+        def fake_generate(messages, _config):
+            calls.append(deepcopy(messages))
+            return "어린이용 설명"
+
+        runtime = deepcopy(self.config)
+        runtime["data"]["gold_path"] = str(self.gold_path)
+        service = DocentChatService(config=runtime, store=FakeStore([]), generate_fn=fake_generate)
+        result = service.describe_relic(relic_label="본관 2789", visitor_type="child")
+
+        self.assertEqual(result["visitor_type"], "child")
+        self.assertEqual(calls[0][0]["role"], "system")
+        self.assertIn("유물명이 아니라 소장품번호", DOCENT_SYSTEM_PROMPT)
+        self.assertIn(VISITOR_INSTRUCTIONS["child"], calls[0][0]["content"])
+        self.assertIn(INITIAL_DESCRIPTION_INSTRUCTION, calls[0][0]["content"])
+        expected_name = get_relic_records_by_label(self.gold_path, "본관 2789")[0]["text"].split("—", 1)[0].strip()
+        self.assertIn(f"현재 유물 '{expected_name}'", calls[0][1]["content"])
+        self.assertIn("'본관 2789'은 유물명이 아니라 소장품번호", calls[0][1]["content"])
+        with self.assertRaisesRegex(ValueError, "child, general, expert"):
+            service.describe_relic(relic_label="본관 2789", visitor_type="test")
+
+    def test_greeting_is_limited_to_first_follow_up(self):
+        calls = []
+
+        def fake_generate(messages, _config):
+            calls.append(deepcopy(messages))
+            return "답변"
+
+        runtime = deepcopy(self.config)
+        runtime["data"]["gold_path"] = str(self.gold_path)
+        service = DocentChatService(config=runtime, store=FakeStore([]), generate_fn=fake_generate)
+        initial = service.describe_relic(relic_label="본관 2789", visitor_type="child")
+        service.answer_follow_up("제작 기법은 무엇이야?", session_id=initial["session_id"])
+        service.answer_follow_up("재질은 무엇이야?", session_id=initial["session_id"])
+
+        self.assertIn(INITIAL_DESCRIPTION_INSTRUCTION, calls[0][0]["content"])
+        self.assertIn(FIRST_FOLLOW_UP_INSTRUCTION, calls[1][0]["content"])
+        self.assertNotIn(LATER_FOLLOW_UP_INSTRUCTION, calls[1][0]["content"])
+        self.assertIn(LATER_FOLLOW_UP_INSTRUCTION, calls[2][0]["content"])
+        self.assertNotIn(FIRST_FOLLOW_UP_INSTRUCTION, calls[2][0]["content"])
+
+    def test_repeated_generated_greeting_is_removed_from_later_answers(self):
+        responses = iter([
+            "안녕하세요! 질문해 주셔서 고마워요! 최초 설명",
+            "안녕하세요! 질문해 주셔서 고마워요! 첫 후속 답변",
+            "안녕하세요! 질문해 주셔서 고마워요! 두 번째 후속 답변",
+        ])
+
+        runtime = deepcopy(self.config)
+        runtime["data"]["gold_path"] = str(self.gold_path)
+        service = DocentChatService(
+            config=runtime,
+            store=FakeStore([]),
+            generate_fn=lambda _messages, _config: next(responses),
+        )
+        initial = service.describe_relic(relic_label="본관 2789")
+        first = service.answer_follow_up("제작 기법은?", session_id=initial["session_id"])
+        second = service.answer_follow_up("재질은?", session_id=initial["session_id"])
+
+        self.assertEqual(initial["answer"], "최초 설명")
+        self.assertEqual(first["answer"], "안녕하세요! 질문해 주셔서 고마워요! 첫 후속 답변")
+        self.assertEqual(second["answer"], "두 번째 후속 답변")
+
+    def test_evicted_messages_are_accumulated_in_summary(self):
+        def fake_generate(messages, _config):
+            if "메모리 요약기" in messages[0]["content"]:
+                return "이전 대화의 누적 요약"
+            return "답변"
+
+        runtime = deepcopy(self.config)
+        runtime["data"]["gold_path"] = str(self.gold_path)
+        runtime["chat"]["history_turns"] = 1
+        service = DocentChatService(
+            config=runtime,
+            store=FakeStore([]),
+            generate_fn=fake_generate,
+        )
+        initial = service.describe_relic(relic_label="본관 2789")
+        service.answer_follow_up("첫 질문", session_id=initial["session_id"])
+        second = service.answer_follow_up("둘째 질문", session_id=initial["session_id"])
+        session = service.get_session(initial["session_id"])
+
+        self.assertEqual(second["conversation_summary"], "이전 대화의 누적 요약")
+        self.assertEqual(session["summary"], "이전 대화의 누적 요약")
+        self.assertEqual(session["summarized_message_count"], 1)
+
+    def test_develop_backend_docent_contract_uses_feature_pipeline(self):
+        docs = [Document(
+            id="other:desc-00",
+            page_content="검색 자료",
+            metadata={"chunk_id": "other:desc-00", "relic_label": "신수 1794"},
+        )]
+        runtime = deepcopy(self.config)
+        runtime["data"]["gold_path"] = str(self.gold_path)
+        adapter = Docent(
+            config=runtime,
+            store=FakeStore(docs),
+            generate_fn=lambda _messages, _config: "호환 답변",
+        )
+
+        description = adapter.describe("bon002789", visitor_type="general")
+        first, route = adapter.chat("bon002789", "비슷한 유물은?", history=[])
+        second, _ = adapter.chat(
+            "bon002789",
+            "그 유물의 특징은?",
+            history=[
+                {"role": "user", "content": "비슷한 유물은?"},
+                {"role": "assistant", "content": first.answer},
+            ],
+        )
+
+        self.assertEqual(description.route, "artifact")
+        self.assertEqual(route.route, "search")
+        self.assertIn("other:desc-00", first.sources)
+        self.assertEqual(second.answer, "호환 답변")
+        with self.assertRaises(ArtifactNotFound):
+            adapter.describe("missing-artifact")
+
+    def test_rewrite_falls_back_when_small_model_drops_entities(self):
+        runtime = deepcopy(self.config)
+        runtime["data"]["gold_path"] = str(self.gold_path)
+        service = DocentChatService(
+            config=runtime,
+            store=FakeStore([]),
+            generate_fn=lambda _messages, _config: "이 유물",
+        )
+        rewritten = service.rewrite_query(
+            question="이 유물은 어디에서 발견됐어?",
+            current_relic_label="본관 2789",
+            current_relic_name="금동 반가 사유상",
+            history=[{"role": "assistant", "content": "현재 유물 설명"}],
+        )
+        self.assertIn("금동 반가 사유상", rewritten)
+        self.assertIn("어디에서 발견", rewritten)
+
+    def test_explicit_comparison_retrieves_only_other_target(self):
+        runtime = deepcopy(self.config)
+        runtime["data"]["gold_path"] = str(self.gold_path)
+        service = DocentChatService(config=runtime, store=FakeStore([]),
+                                    generate_fn=lambda _messages, _config: "사용되지 않음")
+        rewritten = service.rewrite_query(
+            question="이 유물과 농경문 청동기를 비교해줘.",
+            current_relic_label="본관 2789",
+            current_relic_name="금동 반가 사유상",
+            history=[],
+        )
+        self.assertEqual(rewritten, "농경문 청동기")
+
+    def test_recall_and_mrr(self):
+        docs = [
+            Document(id="X", page_content="x", metadata={"chunk_id": "X", "relic_label": "Lx"}),
+            Document(id="A", page_content="a", metadata={"chunk_id": "A", "relic_label": "La"}),
+            Document(id="B", page_content="b", metadata={"chunk_id": "B", "relic_label": "Lb"}),
+            Document(id="Y", page_content="y", metadata={"chunk_id": "Y", "relic_label": "Ly"}),
+            Document(id="Z", page_content="z", metadata={"chunk_id": "Z", "relic_label": "Lz"}),
+        ]
+        result = evaluate(FakeStore(docs), [{
+            "id": "q1", "question": "질문", "category": "test",
+            "relevant_chunk_ids": ["A", "B"],
+            "relevant_relic_labels": ["La", "Lb"],
+        }], {"top_k": 5})
+        self.assertEqual(result["recall_at_1"], 0.0)
+        self.assertEqual(result["recall_at_3"], 1.0)
+        self.assertEqual(result["recall_at_5"], 1.0)
+        self.assertEqual(result["mrr"], 0.5)
+
+    def test_evaluation_query_must_not_expose_relic_label(self):
+        valid = [{
+            "id": "q1",
+            "question": "보물 1437호 백자 달항아리의 크기는?",
+            "relevant_chunk_ids": ["A"],
+            "relevant_relic_labels": ["접수 702"],
+        }]
+        validate_no_relic_labels_in_queries(valid, {"접수 702"})
+
+        invalid = [{**valid[0], "question": "접수 702의 크기는?"}]
+        with self.assertRaisesRegex(ValueError, "relic_label '접수 702'"):
+            validate_no_relic_labels_in_queries(invalid, {"접수 702"})
+
+
+if __name__ == "__main__":
+    unittest.main()

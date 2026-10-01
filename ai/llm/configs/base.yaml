@@ -1,0 +1,55 @@
+data:
+  gold_path: data/gold/gold0929.jsonl
+
+runtime:
+  initial_relic_label: "본관 2789"
+
+embedding:
+  model: BAAI/bge-m3
+  device: auto
+  batch_size: 32
+  normalize_embeddings: true
+  query_prefix: ""
+  document_prefix: ""
+
+vector_db:
+  provider: chroma
+  persist_directory: ai/rag/storage/chroma
+  collection_name: museum_relics
+  add_batch_size: 256
+
+retrieval:
+  top_k: 5
+
+chat:
+  history_turns: 5
+  summary_enabled: true
+  summary_max_chars: 2000
+
+query_rewrite:
+  enabled: true
+
+llm:
+  enabled: true
+  provider: ollama
+  # 기존 태그 qwen3:8b-q4_K_M은 현재 Ollama 서버에 없어 설치된 qwen3 태그를 사용한다.
+  model: exaone3.5:7.8b
+  visitor_types:
+    - child
+    - general
+    - expert
+  visitor_type: child
+  temperature: 0.2
+  top_p: 0.9
+  num_predict: 1024
+  num_ctx: 8192
+  reasoning: false
+  # 아래 항목은 provider: transformers일 때 사용합니다.
+  source: huggingface
+  quantization: nf4
+  device: cuda:0
+  compute_dtype: auto
+  trust_remote_code: false
+  max_input_tokens: 4096
+  max_new_tokens: 512
+  enable_thinking: false

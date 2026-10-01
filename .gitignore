@@ -244,3 +244,6 @@ data/rag/
 # 끝에 / 를 붙이지 않아야 심볼릭 링크로 둔 경우에도 제외된다.
 data/index
 data/gold
+!data/gold/
+data/gold/*
+!data/gold/gold0929.jsonl

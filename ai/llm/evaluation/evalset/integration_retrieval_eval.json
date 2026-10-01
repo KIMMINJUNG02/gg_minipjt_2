@@ -1,0 +1,42 @@
+[
+  {
+    "id": "service-q001",
+    "question": "농경문 청동기에는 어떤 장면이 새겨져 있나요?",
+    "current_relic_label": "신수 1794",
+    "relevant_chunk_ids": ["nmm-sinsu-001794-00:desc-00"],
+    "relevant_relic_labels": ["신수 1794"],
+    "category": "feature"
+  },
+  {
+    "id": "service-q002",
+    "question": "서울 암사동 집터유적에서 출토된 토기는 무엇인가요?",
+    "current_relic_label": null,
+    "relevant_chunk_ids": ["nmm-sinsu-022891-00:desc-00"],
+    "relevant_relic_labels": ["신수 22891"],
+    "category": "find_place"
+  },
+  {
+    "id": "service-q003",
+    "question": "백자 달항아리는 왜 달항아리라고 불리나요?",
+    "current_relic_label": "접수 702",
+    "relevant_chunk_ids": ["nmm-jeopsu-000702-00:desc-00"],
+    "relevant_relic_labels": ["접수 702"],
+    "category": "feature"
+  },
+  {
+    "id": "service-q004",
+    "question": "속이 비고 두께가 2~4mm인 금동불은 무엇인가요?",
+    "current_relic_label": "본관 2789",
+    "relevant_chunk_ids": ["nmm-bon-002789-00:desc-00"],
+    "relevant_relic_labels": ["본관 2789"],
+    "category": "technique"
+  },
+  {
+    "id": "service-q005",
+    "question": "비파 모양을 닮았다고도 부르는 청동검은 무엇인가요?",
+    "current_relic_label": "신수 3094",
+    "relevant_chunk_ids": ["nmm-sinsu-003094-00:desc-00"],
+    "relevant_relic_labels": ["신수 3094"],
+    "category": "feature"
+  }
+]
